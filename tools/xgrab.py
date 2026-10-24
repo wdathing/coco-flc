@@ -52,7 +52,11 @@ class Gdb:
     def cmd(self, body):
         csum = sum(body.encode()) & 0xFF
         self.s.sendall(f"${body}#{csum:02x}".encode())
-        return self._recv_packet()
+        reply = self._recv_packet()
+        # a stop reply left over from halt() retries is not our answer
+        while body != "?" and re.fullmatch(r"[ST][0-9a-f]{2}.*", reply):
+            reply = self._recv_packet()
+        return reply
 
     def halt(self):
         # XRoar stops the machine shortly after a GDB client connects; packets

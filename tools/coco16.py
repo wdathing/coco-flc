@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Convert an FLI/FLC into a CoCo 3 friendly 16-colour FLI.
+
+    coco16.py IN.flc OUT.FLI [--dither] [--preview DIR]
+
+* One palette for the whole animation: a histogram of every frame is binned
+  into the GIME 4x4x4 colour cube and 16 colours are picked the same way the
+  player does (most used first, then weighted farthest-point).
+* Every pixel becomes one of those 16 GIME-exact colours, so the player's own
+  colour analysis maps them 1:1.
+* Deltas are re-encoded (BYTE_RUN first frame, DELTA_FLI after, ring frame).
+  Pixels that only changed by palette noise collapse to "no change", which
+  shrinks the file and speeds up playback.
+* --dither uses a 4x4 ordered (Bayer) dither: better gradients, and because
+  the pattern is fixed to the screen, still areas stay still between frames.
+"""
+import argparse
+import os
+import struct
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import flclib  # noqa: E402
+
+LEVELS = np.array([0, 85, 170, 255])
+BAYER4 = (np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]) + 0.5) / 16 - 0.5
+
+
+def cube_index(rgb):
+    lv = np.clip((rgb.astype(np.int32) + 42) // 85, 0, 3)
+    return lv[..., 0] * 16 + lv[..., 1] * 4 + lv[..., 2]
+
+
+def cube_rgb(q):
+    q = np.asarray(q)
+    return np.stack([LEVELS[q >> 4], LEVELS[(q >> 2) & 3], LEVELS[q & 3]], -1)
+
+
+def choose16(weights):
+    """weights: 64 pixel counts per cube colour -> up to 16 cube indices."""
+    pts = cube_rgb(np.arange(64)) // 85
+    chosen = []
+    while len(chosen) < 16:
+        if chosen:
+            d = ((pts[:, None, :] - pts[None, chosen, :]) ** 2).sum(-1).min(1)
+        else:
+            d = np.ones(64, np.int64)
+        score = weights.astype(np.int64) * d
+        if score.max() <= 0:
+            break
+        chosen.append(int(score.argmax()))
+    return chosen or [0]
+
+
+# Encoder tuning. On the CoCo a packet costs roughly as much as 7 literal
+# pixels, so it pays to resend a few unchanged pixels inside a span (GAP) and
+# to only use fills for longer runs (MINFILL).
+GAP = 8
+MINFILL = 6
+DISK_BYTES = 150 * 2304     # one 80-track disk side after FLCPLAY.BIN
+
+
+def enc_lc_fast(prev, cur):
+    """DELTA_FLI encoder using numpy to find changed spans."""
+    h, w = cur.shape
+    rows = np.flatnonzero((prev != cur).any(1))
+    if rows.size == 0:
+        return None
+    y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    out = bytearray(struct.pack("<HH", y0, y1 - y0))
+    for y in range(y0, y1):
+        a, b = prev[y], cur[y]
+        idx = np.flatnonzero(a != b)
+        pk = bytearray()
+        npk = 0
+        if idx.size:
+            # merge changed pixels separated by small gaps (a new packet costs 2 bytes)
+            br = np.flatnonzero(np.diff(idx) > GAP)
+            starts = idx[np.r_[0, br + 1]]
+            ends = idx[np.r_[br, idx.size - 1]] + 1
+            x = 0
+            for s, e in zip(starts.tolist(), ends.tolist()):
+                skip = s - x
+                while skip > 255:
+                    pk += b"\xff\x00"          # skip 255, empty literal
+                    npk += 1
+                    skip -= 255
+                seg = b[s:e]
+                # runs inside the span
+                cut = np.flatnonzero(np.diff(seg) != 0) + 1
+                rs = np.r_[0, cut]
+                rl = np.diff(np.r_[rs, seg.size])
+                first = True
+                lit = []
+
+                def flush_lit():
+                    nonlocal first, npk
+                    i = 0
+                    while i < len(lit):
+                        c = min(127, len(lit) - i)
+                        pk.extend(bytes((skip if first else 0, c)))
+                        pk.extend(bytes(lit[i:i + c]))
+                        first = False
+                        npk += 1
+                        i += c
+                    lit.clear()
+
+                for st, ln in zip(rs.tolist(), rl.tolist()):
+                    if ln >= MINFILL:
+                        flush_lit()
+                        while ln > 0:
+                            c = min(128, ln)
+                            pk.extend(bytes((skip if first else 0, (256 - c) & 255, int(seg[st]))))
+                            first = False
+                            npk += 1
+                            st += c
+                            ln -= c
+                    else:
+                        lit.extend(seg[st:st + ln].tolist())
+                flush_lit()
+                x = e
+        if npk > 255:   # pathological row: send it as plain literals
+            pk = bytearray()
+            npk = 0
+            x = 0
+            while x < w:
+                c = min(127, w - x)
+                pk += bytes((0, c)) + b[x:x + c].tobytes()
+                npk += 1
+                x += c
+        out.append(npk)
+        out += pk
+    return flclib._chunk(flclib.DELTA_FLI, bytes(out))
+
+
+def convert(src, dst, dither=False, preview=None):
+    frames, pals = [], []
+    for img, pal in flclib.decode(src):
+        frames.append(img)
+        pals.append(np.array(pal, np.int32))
+    hdr = open(src, "rb").read(128)
+    nframes = struct.unpack_from("<H", hdr, 6)[0]
+    frames, pals = frames[:nframes], pals[:nframes]   # drop the source ring frame
+    if struct.unpack_from("<H", hdr, 4)[0] == 0xAF11:
+        speed_ms = struct.unpack_from("<H", hdr, 16)[0] * 1000 // 70
+    else:
+        speed_ms = struct.unpack_from("<I", hdr, 16)[0]
+
+    weights = np.zeros(64, np.int64)
+    for img, pal in zip(frames, pals):
+        counts = np.bincount(img.ravel(), minlength=256)
+        np.add.at(weights, cube_index(pal), counts)
+    chosen = choose16(weights)
+    crgb = cube_rgb(chosen).astype(np.int32)
+
+    out = []
+    h, w = frames[0].shape
+    thr = np.tile(BAYER4, (h // 4 + 1, w // 4 + 1))[:h, :w, None] * 85
+    for img, pal in zip(frames, pals):
+        rgb = pal[img].astype(np.float32)
+        if dither:
+            rgb = rgb + thr
+        d = ((rgb[:, :, None, :] - crgb[None, None, :, :]) ** 2).sum(-1)
+        out.append(d.argmin(-1).astype(np.uint8))
+
+    pal16 = [tuple(int(v) for v in c) for c in crgb] + [(0, 0, 0)] * (256 - len(chosen))
+    global GAP, MINFILL
+    body = encode(out, pal16)
+    if 128 + len(body) > DISK_BYTES and (GAP, MINFILL) != (3, 3):
+        GAP, MINFILL = 3, 3     # too big for a disk: fall back to the compact encoding
+        body = encode(out, pal16)
+    h, w = out[0].shape
+    newhdr = bytearray(128)
+    struct.pack_into("<IHHHHHHH", newhdr, 0, 128 + len(body), 0xAF11, len(out), w, h, 8, 3,
+                     max(1, round(speed_ms * 70 / 1000)))
+    newhdr[26:58] = hdr[26:58]          # keep the 3DPC tag + title
+    with open(dst, "wb") as f:
+        f.write(newhdr + body)
+
+    if preview:
+        from PIL import Image
+        os.makedirs(preview, exist_ok=True)
+        base = os.path.splitext(os.path.basename(dst))[0]
+        Image.fromarray(crgb.astype(np.uint8)[out[min(3, len(out) - 1)]]).save(
+            os.path.join(preview, base + ".png"))
+    return 128 + len(body), len(chosen)
+
+
+def encode(out, pal16):
+    """Palette + BYTE_RUN, DELTA_FLI frames, ring frame back to frame 1."""
+    chunks_out = []
+    seq = list(range(len(out))) + [0]
+    prev = np.zeros_like(out[0])
+    for n, i in enumerate(seq):
+        chunks = []
+        if n == 0:
+            chunks.append(flclib.enc_color(pal16, six_bit=True))
+            chunks.append(flclib.enc_brun(out[i]))
+        else:
+            c = enc_lc_fast(prev, out[i])
+            if c:
+                chunks.append(c)
+        chunks_out.append(flclib._frame(chunks))
+        prev = out[i]
+    return b"".join(chunks_out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src")
+    ap.add_argument("dst")
+    ap.add_argument("--dither", action="store_true")
+    ap.add_argument("--preview")
+    ap.add_argument("--verify", action="store_true", help="decode the output and compare")
+    a = ap.parse_args()
+    size, ncol = convert(a.src, a.dst, a.dither, a.preview)
+    msg = f"{os.path.basename(a.dst)}: {os.path.getsize(a.src) // 1024}K -> {size // 1024}K ({ncol} colours)"
+    if a.verify:
+        n = sum(1 for _ in flclib.decode(a.dst))
+        msg += f", {n} frames decode OK"
+    print(msg)
+
+
+if __name__ == "__main__":
+    main()

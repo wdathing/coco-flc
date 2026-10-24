@@ -69,6 +69,7 @@ def main():
         ("BALLS.FLC", balls(320, 200, 24), "flc", False),
         ("SMALL.FLC", balls(161, 101, 16), "flc", False),
         ("BOUNCE.FLI", balls(320, 200, 12), "fli", True),
+        ("LOOP.FLI", balls(255, 150, 10), "fli", False),
     ]
     for name, frames, kind, copy_first in jobs:
         path = os.path.join(outdir, name)

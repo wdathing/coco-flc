@@ -16,6 +16,10 @@
 ;
 ; Register use inside decoders:  U=source  X=screen byte  Y=$0F80  DP=$0E
 ; podd: 1 when the next pixel goes in the low nibble of ,X
+;
+; On a 6309 (flc_6309 != 0, set by the C side after cpu_is_6309()) chunks
+; are decoded in native mode and long fills use TFM. 6309-only opcodes are
+; always behind a flc_6309 test, so a 6809 never executes them.
 
 LOTBL   equ     $0E00
 HITBL   equ     $0F00
@@ -23,6 +27,7 @@ HIMID   equ     $0F80
 SRCSLD  equ     $E000
 SCRWIN  equ     $8000
 
+        PRAGMA  autobranchlength
         SECTION code
 
 _flc_chunk      EXPORT
@@ -39,9 +44,13 @@ _flc_w          EXPORT
 _flc_h          EXPORT
 _flc_hist_mode  EXPORT
 _flc_pal_dirty  EXPORT
+_flc_pal_lo     EXPORT
+_flc_pal_hi     EXPORT
 _flc_ticks      EXPORT
 _flc_pal        EXPORT
 _flc_hist       EXPORT
+_flc_6309       EXPORT
+_cpu_is_6309    EXPORT
 
 ;------------------------------------------------------------------------------
 ; void flc_chunk(byte type)
@@ -62,7 +71,10 @@ _flc_chunk
         tfr     a,dp
         ldy     #HIMID
         ldu     _flc_src_ptr
-        ldb     9,s                     ; type (low byte of int arg)
+        tst     _flc_6309
+        beq     @emu
+        ldmd    #1                      ; 6309 native mode while decoding
+@emu    ldb     9,s                     ; type (low byte of int arg)
         cmpb    #15
         bne     @n1
         lbsr    brun
@@ -94,7 +106,10 @@ _flc_chunk
         sta     colsh
         lbsr    color
 @exit   stu     _flc_src_ptr
-        ldd     mmusv
+        tst     _flc_6309
+        beq     @emu2
+        ldmd    #0                      ; back to 6809 mode for C and BASIC
+@emu2   ldd     mmusv
         std     $FFA4
         ldd     mmusv+2
         std     $FFA6
@@ -131,6 +146,35 @@ setrow  lda     cury+1
         adda    #SCRWIN/256
         tfr     d,x
         clr     podd
+        rts
+
+; Row cury for decoders that walk rows 0,1,2,...: full setup only for row 0
+seqrow  ldd     cury
+        lbeq    setrow
+        lbra    nextrow
+
+; Advance to the row below: X = its first byte, podd = 0. A step of 160
+; crosses into a new page exactly when the in-page offset drops below 160.
+nextrow ldd     rowoff
+        addd    #160
+        std     rowoff
+        anda    #$1F
+        adda    #SCRWIN/256
+        tfr     d,x
+        cmpx    #SCRWIN+160
+        bhs     @same
+        lda     rowoff
+        lsra
+        lsra
+        lsra
+        lsra
+        lsra
+        pshs    x
+        ldx     #_flc_scr_pages
+        ldd     a,x
+        std     $FFA4
+        puls    x
+@same   clr     podd
         rts
 
 ; Advance B pixels (0..255)
@@ -283,13 +327,146 @@ hfill   std     fc
         puls    d,x,pc
 
 ;------------------------------------------------------------------------------
-; BYTE_RUN (15): full frame, run-length encoded
-brun    clr     cury
+; BYTE_RUN (15): full frame, run-length encoded. Same E/O parity scheme as
+; DELTA_FLI; a row ends when X reaches the per-row end for the current
+; state (patched into the two cmpx below).
+brun    tst     _flc_hist_mode
+        lbne    brunslow
+        clr     cury
+        clr     cury+1
+        lbsr    setrow
+        bra     @row
+@line   ldd     cury                    ; next row
+        addd    #1
+        std     cury
+        cmpd    _flc_h
+        lbhs    @done
+        lbsr    nextrow
+@row    cmpu    #SRCSLD
+        blo     @ok
+        lbsr    slide
+@ok     pshs    x                       ; E state ends at X0+(w+1)/2,
+        ldd     _flc_w                  ; O state at X0+w/2
+        addd    #1
+        lsra
+        rorb
+        addd    ,s
+        std     @ce+1
+        ldd     _flc_w
+        lsra
+        rorb
+        addd    ,s++
+        std     @co+1
+        leau    1,u                     ; packet count is unreliable; use width
+        bra     @epk
+; ---- E state
+@enext
+@ce     cmpx    #0
+        bhs     @line
+@epk    ldb     ,u+
+        bmi     @elit
+        beq     @line                   ; malformed; give up on this row
+        lda     ,u+                     ; fill B pixels
+        sta     @m3+1
+        lda     a,y
+@m3     ora     <0
+@efv    lsrb
+        bcs     @efo
+        beq     @enext
+        cmpb    #6
+        bhs     @t1
+@el     sta     ,x+
+        decb
+        bne     @el
+        bra     @enext
+@t1     lbsr    fillw
+        bra     @enext
+@efo    beq     @eo1
+        cmpb    #6
+        bhs     @t2
+@el2    sta     ,x+
+        decb
+        bne     @el2
+        bra     @eo1
+@t2     lbsr    fillw
+@eo1    anda    #$F0                    ; odd pixel -> high nibble, go O
+        sta     @m4+1
+        lda     ,x
+        anda    #$0F
+@m4     ora     #0
+        sta     ,x
+        bra     @onext
+@elit   negb                            ; literal: B pixels
+@elv    lsrb
+        bcs     @elo
+        beq     @enext
+        stb     cntb
+@elp    ldd     ,u++
+        stb     @m1+1
+        lda     a,y
+@m1     ora     <0
+        sta     ,x+
+        dec     cntb
+        bne     @elp
+        bra     @enext
+@elo    beq     @elo1
+        stb     cntb
+@elp2   ldd     ,u++
+        stb     @m1b+1
+        lda     a,y
+@m1b    ora     <0
+        sta     ,x+
+        dec     cntb
+        bne     @elp2
+@elo1   ldb     ,u+                     ; odd pixel -> high nibble, go O
+        lda     b,y
+        sta     @m2+1
+        lda     ,x
+        anda    #$0F
+@m2     ora     #0
+        sta     ,x
+; ---- O state
+@onext
+@co     cmpx    #0
+        lbhs    @line
+        ldb     ,u+
+        bmi     @olit
+        lbeq    @line
+        decb                            ; fill: one pixel here, rest as E
+        lda     ,u+
+        sta     @m6+1
+        lda     a,y
+@m6     ora     <0
+        pshs    b
+        tfr     a,b
+        andb    #$0F
+        stb     @m7+1
+        ldb     ,x
+        andb    #$F0
+@m7     orb     #0
+        stb     ,x+
+        puls    b
+        bra     @efv
+@olit   negb                            ; literal: one pixel here, rest as E
+        decb
+        stb     cntb
+        lda     ,x
+        anda    #$F0
+        ldb     ,u+
+        stb     @m5+1
+@m5     ora     <0
+        sta     ,x+
+        ldb     cntb
+        bra     @elv
+@done   rts
+
+; General BYTE_RUN path (used for the histogram pass)
+brunslow    clr     cury
         clr     cury+1
 @line   ldd     cury
         cmpd    _flc_h
         bhs     @done
-        lbsr    setrow
+        lbsr    seqrow
         leau    1,u                     ; packet count is unreliable; use width
         ldd     _flc_w
         std     xrem
@@ -331,7 +508,7 @@ copy    clr     cury
 @line   ldd     cury
         cmpd    _flc_h
         bhs     @done
-        lbsr    setrow
+        lbsr    seqrow
         cmpu    #SRCSLD
         blo     @ok
         lbsr    slide
@@ -349,7 +526,7 @@ black   clr     cury
 @line   ldd     cury
         cmpd    _flc_h
         bhs     @done
-        lbsr    setrow
+        lbsr    seqrow
         ldd     _flc_w
         std     cnt
         clra
@@ -361,8 +538,243 @@ black   clr     cury
         bra     @line
 @done   rts
 
-; DELTA_FLI (12): byte-oriented line deltas
-lc      ldb     ,u+
+;------------------------------------------------------------------------------
+; DELTA_FLI (12): byte-oriented line deltas.
+; Pixel parity is carried by where we are in the code instead of podd:
+;   E state - next pixel is the high nibble of ,X
+;   O state - next pixel is the low nibble of ,X (high nibble already done)
+; An O-state fill/literal writes its first pixel, then continues as E.
+; Odd/even run lengths take separate copies of each loop so no count has
+; to be kept in memory. Fills of 6+ bytes go through fillw.
+lc      tst     _flc_hist_mode
+        lbne    lcslow
+        ldb     ,u+
+        lda     ,u+
+        std     cury
+        ldb     ,u+
+        lda     ,u+
+        std     nlines
+        ldd     cury
+        cmpd    _flc_h
+        lbhs    @done
+        lbsr    setrow
+        bra     @row
+@line   ldd     cury                    ; next row
+        addd    #1
+        std     cury
+        cmpd    _flc_h
+        lbhs    @done
+        lbsr    nextrow
+@row    ldd     nlines
+        lbeq    @done
+        subd    #1
+        std     nlines
+        cmpu    #SRCSLD                 ; a row's data is < 1K, check per row
+        blo     @ok
+        lbsr    slide
+@ok     lda     ,u+
+        beq     @line
+        sta     npk
+; ---- E state
+@epk    ldb     ,u+                     ; skip
+        lsrb
+        abx                             ; abx leaves C alone
+        bcs     @ocnt
+@ecnt   ldb     ,u+                     ; count
+        bmi     @efill
+        beq     @enext
+@elit   lsrb                            ; literal: B pairs, C = odd pixel
+        bcs     @elo
+        beq     @enext
+        stb     cntb
+@elp    ldd     ,u++
+        stb     @m1+1
+        lda     a,y
+@m1     ora     <0
+        sta     ,x+
+        dec     cntb
+        bne     @elp
+@enext  dec     npk
+        bne     @epk
+        bra     @line
+@elo    beq     @elo1
+        stb     cntb
+@elp2   ldd     ,u++
+        stb     @m1b+1
+        lda     a,y
+@m1b    ora     <0
+        sta     ,x+
+        dec     cntb
+        bne     @elp2
+@elo1   ldb     ,u+                     ; odd pixel -> high nibble, go O
+        lda     b,y
+        sta     @m2+1
+        lda     ,x
+        anda    #$0F
+@m2     ora     #0
+        sta     ,x
+        bra     @onext
+@efill  negb                            ; fill: B pixels of one colour
+        lda     ,u+
+        sta     @m3+1
+        lda     a,y
+@m3     ora     <0                      ; A = colour in both nibbles
+@efv    lsrb                            ; B bytes, C = odd pixel
+        bcs     @efo
+        beq     @enext
+        cmpb    #6
+        bhs     @t1
+@el     sta     ,x+
+        decb
+        bne     @el
+        bra     @enext
+@t1     lbsr    fillw
+        bra     @enext
+@efo    beq     @eo1
+        cmpb    #6
+        bhs     @t2
+@el2    sta     ,x+
+        decb
+        bne     @el2
+        bra     @eo1
+@t2     lbsr    fillw
+@eo1    anda    #$F0                    ; odd pixel -> high nibble, go O
+        sta     @m4+1
+        lda     ,x
+        anda    #$0F
+@m4     ora     #0
+        sta     ,x
+; ---- O state
+@onext  dec     npk
+        lbeq    @line
+@opk    ldb     ,u+                     ; skip n: odd n lands on a high nibble
+        lsrb
+        abx
+        bcc     @ocnt
+        leax    1,x
+        bra     @ecnt
+@ocnt   ldb     ,u+
+        bmi     @ofill
+        beq     @onext
+        decb                            ; literal: one pixel here, rest as E
+        stb     cntb
+        lda     ,x
+        anda    #$F0
+        ldb     ,u+
+        stb     @m5+1
+@m5     ora     <0
+        sta     ,x+
+        ldb     cntb
+        lbra    @elit
+@ofill  negb                            ; fill: one pixel here, rest as E
+        decb
+        lda     ,u+
+        sta     @m6+1
+        lda     a,y
+@m6     ora     <0
+        pshs    b
+        tfr     a,b
+        andb    #$0F
+        stb     @m7+1
+        ldb     ,x
+        andb    #$F0
+@m7     orb     #0
+        stb     ,x+
+        puls    b
+        bra     @efv
+@done   rts
+
+; Fill B (>0) bytes at X with A; A is preserved.
+; 6809: jump into an unrolled run of word stores. 6309: TFM.
+fillw   tst     _flc_6309
+        bne     tfmfill
+        lsrb                            ; words, C = odd byte
+        bcc     @even
+        sta     ,x+
+@even   pshs    u
+        negb                            ; enter 2*words bytes before @end
+        lslb                            ; (64 words max -> -128)
+        leau    @end,pcr
+        leau    b,u
+        tfr     a,b
+        jmp     ,u
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+@end    puls    u,pc
+
+; 6309 only: fill B (>0) bytes at X with A using TFM; returns A intact
+tfmfill sta     fv
+        tfr     b,f
+        clre
+        ldd     #fv
+        tfm     d,x+
+        lda     fv
+        rts
+
+; General DELTA_FLI path (used for the histogram pass)
+lcslow  ldb     ,u+
         lda     ,u+
         std     cury
         ldb     ,u+
@@ -470,9 +882,13 @@ ss2     ldb     ,u+
         lda     a,y
 @fm2    ora     <0
         ldb     fv
+        cmpb    #6
+        bhs     @fwlong
 @fwfl   sta     ,x+
         decb
         bne     @fwfl
+        bra     @fnx
+@fwlong lbsr    fillw
 @fnx    dec     npk
         bne     @fpk
         bra     @eol
@@ -541,7 +957,8 @@ ss2     ldb     ,u+
         lbra    @line
 @done   rts
 
-; COLOR_256 (4) / COLOR_64 (11): update flc_pal
+; COLOR_256 (4) / COLOR_64 (11): update flc_pal; entries that really change
+; set flc_pal_dirty and widen flc_pal_lo..flc_pal_hi
 color   ldb     ,u+
         lda     ,u+
         std     npk16
@@ -564,22 +981,36 @@ color   ldb     ,u+
         addd    #_flc_pal
         tfr     d,x
 @c      ldb     #3
+        clr     chg
 @rgb    lda     ,u+
         tst     colsh
         beq     @st
         lsla
         lsla
-@st     sta     ,x+
+@st     cmpa    ,x                      ; only real changes count
+        beq     @eq
+        sta     ,x
+        inc     chg
+@eq     leax    1,x
         decb
         bne     @rgb
-        inc     cidx
+        tst     chg
+        beq     @nc
+        lda     cidx                    ; widen the dirty range
+        cmpa    _flc_pal_lo
+        bhs     @l1
+        sta     _flc_pal_lo
+@l1     cmpa    _flc_pal_hi
+        bls     @l2
+        sta     _flc_pal_hi
+@l2     inc     _flc_pal_dirty
+@nc     inc     cidx
         bne     @nw
         ldx     #_flc_pal               ; index wrapped past 255
 @nw     dec     ccount
         bne     @c
         bra     @pk
-@done   inc     _flc_pal_dirty
-        rts
+@done   rts
 
 ;------------------------------------------------------------------------------
 ; void flc_clear(byte value): fill the whole screen with a byte
@@ -639,6 +1070,19 @@ irqh    lda     $FF03
 @nh     rti
 
 ;------------------------------------------------------------------------------
+; byte cpu_is_6309(void)
+; $10 $43 is COMD on a 6309; a 6809 ignores the prefix and runs COMA.
+_cpu_is_6309
+        ldd     #1
+        fdb     $1043
+        cmpb    #1
+        beq     @no
+        ldb     #1
+        rts
+@no     clrb
+        rts
+
+;------------------------------------------------------------------------------
 ; void call_with_stack(void (*fn)(void), void *stacktop)
 ; Runs fn on a private stack so the $6000-$7FFF window can be remapped freely.
 _call_with_stack
@@ -662,9 +1106,14 @@ _flc_w          rmb     2
 _flc_h          rmb     2
 _flc_hist_mode  rmb     1
 _flc_pal_dirty  rmb     1
+_flc_pal_lo     rmb     1
+_flc_pal_hi     rmb     1
+chg     rmb     1
 _flc_ticks      rmb     1
 _flc_pal        rmb     768
 _flc_hist       rmb     512
+_flc_6309       rmb     1
+cntb    rmb     1
 mmusv   rmb     4
 rowoff  rmb     2
 irqsv   rmb     3

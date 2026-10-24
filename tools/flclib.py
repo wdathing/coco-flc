@@ -289,7 +289,10 @@ def decode(path):
                 elif ctype == BLACK:
                     screen[:] = 0
                 elif ctype == FLI_COPY:
-                    screen[:] = np.frombuffer(c[:w * h], np.uint8).reshape(h, w)
+                    # read w*h bytes even if the chunk size is short (some
+                    # 1993 encoders wrote it 2 bytes low; the CoCo player does too)
+                    raw = data[p + 6:p + 6 + w * h]
+                    screen[:] = np.frombuffer(raw, np.uint8).reshape(h, w)
                 elif ctype == BYTE_RUN:
                     q = 0
                     for y in range(h):

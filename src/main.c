@@ -12,7 +12,6 @@
  *   $8000-$FFFF  BASIC ROM copy; screen + file windows while a chunk decodes
  */
 #include <coco.h>
-#include <disk.h>
 
 typedef unsigned long u32;
 
@@ -24,6 +23,8 @@ typedef unsigned long u32;
 #define BASIC_SLOT3 0x3B
 #define SCR_PAGE    0x30            /* screen at physical $60000-$67CFF */
 #define LIST_ROWS   12
+#define MAX_GRAN    156             /* 80-track single sided RS-DOS (decb dskini -8) */
+#define GRAN_SIZE   2304
 #define MAXENT      72
 
 /* flcdec.asm */
@@ -36,9 +37,13 @@ extern word flc_w;
 extern word flc_h;
 extern byte flc_hist_mode;
 extern byte flc_pal_dirty;
+extern byte flc_pal_lo;
+extern byte flc_pal_hi;
 extern byte flc_ticks;
 extern byte flc_pal[768];
 extern word flc_hist[256];
+extern byte flc_6309;
+byte cpu_is_6309(void);
 void flc_chunk(byte type);
 void flc_clear(byte value);
 void irq_install(void);
@@ -55,7 +60,7 @@ struct Entry
 
 struct Entry entries[MAXENT];
 byte numEntries;
-byte fat[MAX_NUM_GRANULES];
+byte fat[MAX_GRAN];
 byte drive;
 byte poolPages;          /* pages usable for file data */
 byte pagePool[52];
@@ -141,6 +146,57 @@ void initMemory(void)
 
 /* ------------------------------------------------------------------ disk */
 
+/* DSKCON with no range checks. */
+byte dskcon(byte *buf, byte drv, byte track, byte sector)
+{
+    * (byte *) 0x00EA = 2;              /* DCOPC: read */
+    * (byte *) 0x00EB = drv;            /* DCDRV */
+    * (byte *) 0x00EC = track;          /* DCTRK */
+    * (byte *) 0x00ED = sector;         /* DCSEC */
+    * (byte **) 0x00EE = buf;           /* DCBPT */
+    /* DSKCON's ready timeout is a software loop: at 1.79 MHz it expires
+     * before the head can step much past track 40, so run it at normal
+     * speed (transfers are paced by the drive anyway). */
+    asm
+    {
+        pshs    u,y
+        clr     $FFD8
+        jsr     [$C004]
+        clr     $FFD9
+        puls    y,u
+    }
+    return * (byte *) 0x00F0 == 0;      /* DCSTA */
+}
+
+byte headTrack[4] = { 0xFF, 0xFF, 0xFF, 0xFF };    /* last track read; FF = unknown */
+byte hopBuf[256];
+
+/* Read one sector. Unlike CMOC's dskcon() this doesn't stop at track 34, so
+ * 40 and 80 track disks work. Even at normal speed DSKCON's timeout only
+ * covers a seek of roughly 40 tracks, so longer seeks are done in hops of
+ * at most 20 tracks by reading a sector on the way. CoCo 3 only for now
+ * ($FFD8/$FFD9 speed pokes). */
+byte diskRead(byte *buf, byte drv, byte track, byte sector)
+{
+    byte *h = &headTrack[drv & 3];
+    while (*h != 0xFF && (*h > track ? *h - track : track - *h) > 20)
+    {
+        *h = (*h > track) ? *h - 20 : *h + 20;
+        if (!dskcon(hopBuf, drv, *h, 1))
+        {
+            *h = 0xFF;
+            break;
+        }
+    }
+    if (!dskcon(buf, drv, track, sector))
+    {
+        *h = 0xFF;
+        return FALSE;
+    }
+    *h = track;
+    return TRUE;
+}
+
 void granToTS(byte g, byte *track, byte *sector)
 {
     byte t = g >> 1;
@@ -154,9 +210,9 @@ u32 chainSize(byte g, word lastBytes)
 {
     u32 size = 0;
     byte guard, v;
-    for (guard = 0; guard < MAX_NUM_GRANULES; ++guard)
+    for (guard = 0; guard < MAX_GRAN; ++guard)
     {
-        if (g >= MAX_NUM_GRANULES)
+        if (g >= MAX_GRAN)
             return 0;
         v = fat[g];
         if (v >= 0xC0)
@@ -166,7 +222,7 @@ u32 chainSize(byte g, word lastBytes)
                 return size;
             return size + (u32) (v - 1) * 256 + lastBytes;
         }
-        size += GRANULE_SIZE;
+        size += GRAN_SIZE;
         g = v;
     }
     return 0;
@@ -186,12 +242,12 @@ byte readDirectory(void)
     struct Entry *e;
 
     numEntries = 0;
-    if (!readDiskSector(sec, drive, 17, 2))
+    if (!diskRead(sec, drive, 17, 2))
         return FALSE;
-    memcpy(fat, sec, MAX_NUM_GRANULES);
+    memcpy(fat, sec, MAX_GRAN);
     for (s = 3; s <= 11; ++s)
     {
-        if (!readDiskSector(sec, drive, 17, s))
+        if (!diskRead(sec, drive, 17, s))
             return FALSE;
         for (i = 0; i < 8; ++i)
         {
@@ -229,15 +285,17 @@ const char *loadFile(struct Entry *e)
     if (e->size > (u32) poolPages * 8192)
         return "FILE TOO BIG FOR RAM";
 
-    for (guard = 0; guard < MAX_NUM_GRANULES; ++guard)
+    for (guard = 0; guard < MAX_GRAN; ++guard)
     {
+        if (g >= MAX_GRAN)
+            break;
         v = fat[g];
         n = (v >= 0xC0) ? (v & 0x1F) : 9;
         granToTS(g, &track, &sector);
         for (s = 0; s < n; ++s)
         {
             MMU_SLOT3 = pagePool[page];
-            if (!readDiskSector(WINDOW + off, drive, track, sector + s))
+            if (!diskRead(WINDOW + off, drive, track, sector + s))
             {
                 MMU_SLOT3 = BASIC_SLOT3;
                 return "DISK READ ERROR";
@@ -350,15 +408,15 @@ byte absDiff4(byte v, byte lev)
     return (v > t ? v - t : t - v) >> 2;
 }
 
-/* Map every FLC palette entry to the nearest chosen colour. */
-void buildTables(void)
+/* Map FLC palette entries first..last to the nearest chosen colour. */
+void buildTables(word first, word last)
 {
     word c;
     byte k, best, r, g, b;
     word d, bd;
-    byte *p = flc_pal;
+    byte *p = flc_pal + first * 3;
 
-    for (c = 0; c < 256; ++c, p += 3)
+    for (c = first; c <= last; ++c, p += 3)
     {
         bd = 0xFFFF;
         best = 0;
@@ -501,6 +559,9 @@ const char *play(struct Entry *e)
     }
     if (oframe1 == 0)
         oframe1 = 128;
+#ifdef NODELAY
+    delay = 0;                          /* test builds: measure raw speed */
+#endif
 
     x0 = ((320 - flc_w) / 2) & ~1;
     y0 = (200 - flc_h) / 2;
@@ -523,7 +584,10 @@ const char *play(struct Entry *e)
     if (oframe2 == 0)
         oframe2 = next;
     chooseColors();
-    buildTables();
+    buildTables(0, 255);
+    flc_pal_dirty = 0;
+    flc_pal_lo = 255;
+    flc_pal_hi = 0;
 
     for (i = 0; i < 16; ++i)
         savedPalette[i] = * (byte *) (0xFFB0 + i) & 0x3F;
@@ -536,10 +600,12 @@ const char *play(struct Entry *e)
     {
         start = flc_ticks;
         next = doFrame(off);
-        if (flc_pal_dirty)
+        if (flc_pal_dirty)                  /* remap only what changed */
         {
+            buildTables(flc_pal_lo, flc_pal_hi);
             flc_pal_dirty = 0;
-            buildTables();
+            flc_pal_lo = 255;
+            flc_pal_hi = 0;
         }
         ++fi;
         if (next == 0 || fi > frames)       /* error, or ring frame done */
@@ -581,7 +647,7 @@ void drawList(byte sel, byte top)
 {
     byte r, i;
     cls(255);
-    printf("FLC PLAYER 0.1        DRIVE %u\n", drive);
+    printf("FLC PLAYER 0.2  %s   DRIVE %u\n", flc_6309 ? "6309" : "6809", drive);
     printf("--------------------------------");
     if (numEntries == 0)
         printf("\n NO .FLC/.FLI FILES\n");
@@ -673,7 +739,8 @@ int main()
         printf("SORRY, THIS VERSION NEEDS A\nCOCO 3.\n");
         return 0;
     }
-    setHighSpeed(TRUE);
+    setHighSpeed(TRUE);                 /* POKE 65497: 1.79 MHz */
+    flc_6309 = cpu_is_6309();
     width(32);
     for (i = 0; i < 64; ++i)
         sq[i] = (word) i * i;
