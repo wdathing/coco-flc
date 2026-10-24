@@ -44,6 +44,7 @@ extern byte flc_pal[768];
 extern word flc_hist[256];
 extern byte flc_6309;
 byte cpu_is_6309(void);
+void flc_init(void);
 void flc_chunk(byte type);
 void flc_clear(byte value);
 void irq_install(void);
@@ -71,6 +72,7 @@ byte numChosen;
 word sq[64];
 word w64[64];
 byte savedPalette[16];
+byte packed;             /* PACK4 file: header depth 4, 16-colour palette */
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -439,11 +441,21 @@ void buildTables(word first, word last)
 
 /* ------------------------------------------------------------------ video */
 
+/* PACK4 files: palette entries 0-15 are the screen colours. */
+void loadPalette(void)
+{
+    byte i;
+    byte *p = flc_pal;
+    for (i = 0; i < 16; ++i, p += 3)
+        * (byte *) (0xFFB0 + i) = gimeColor((level(p[0]) << 4) | (level(p[1]) << 2) | level(p[2]));
+}
+
 void graphicsOn(void)
 {
     byte i;
-    for (i = 0; i < 16; ++i)
-        * (byte *) (0xFFB0 + i) = gimeColor(chosen[i]);
+    if (!packed)
+        for (i = 0; i < 16; ++i)
+            * (byte *) (0xFFB0 + i) = gimeColor(chosen[i]);
     * (byte *) 0xFF90 = 0x4C;           /* CoCo 3 mode, MMU on, $FExx constant */
     * (byte *) 0xFF98 = 0x80;           /* graphics */
     * (byte *) 0xFF99 = 0x3E;           /* 200 lines, 160 bytes/row, 16 colours */
@@ -451,7 +463,7 @@ void graphicsOn(void)
     * (byte *) 0xFF9D = SCR_PAGE << 2;  /* physical $60000 / 8 */
     * (byte *) 0xFF9E = 0;
     * (byte *) 0xFF9F = 0;
-    * (byte *) 0xFF9A = gimeColor(chosen[LOTBL[0]]);
+    * (byte *) 0xFF9A = packed ? 0 : gimeColor(chosen[LOTBL[0]]);
 }
 
 void textOn(void)
@@ -541,7 +553,10 @@ const char *play(struct Entry *e)
     flc_h = rd16(hdr + 10);
     if (flc_w > 320 || flc_h > 200 || flc_w == 0 || flc_h == 0)
         return "SIZE OVER 320X200 (FOR NOW)";
-    if (rd16(hdr + 12) != 8 && rd16(hdr + 12) != 0)
+    packed = rd16(hdr + 12) == 4;
+    if (packed && (flc_w != 320 || flc_h != 200))
+        return "PACKED FILE NOT 320X200";
+    if (!packed && rd16(hdr + 12) != 8 && rd16(hdr + 12) != 0)
         return "NOT 8 BITS PER PIXEL";
 
     if (magic == 0xAF12)
@@ -567,15 +582,34 @@ const char *play(struct Entry *e)
     y0 = (200 - flc_h) / 2;
     flc_scr_base = y0 * 160 + x0 / 2;
 
-    printf("%ux%u, %u FRAMES\nANALYZING COLOURS...\n", flc_w, flc_h, frames);
-
-    /* First frame in histogram mode: pick 16 colours from what is used. */
+    for (i = 0; i < 16; ++i)
+        savedPalette[i] = * (byte *) (0xFFB0 + i) & 0x3F;
     memset(flc_pal, 0, sizeof(flc_pal));
-    memset(flc_hist, 0, sizeof(flc_hist));
     irq_install();
-    flc_hist_mode = 1;
-    next = doFrame(oframe1);
-    flc_hist_mode = 0;
+    if (packed)
+    {
+        /* PACK4: the first frame is a delta from a black screen and brings
+         * its own palette, so just draw it. */
+        printf("%u FRAMES, PACKED\n", frames);
+        flc_clear(0);
+        next = doFrame(oframe1);
+        loadPalette();
+    }
+    else
+    {
+        printf("%ux%u, %u FRAMES\nANALYZING COLOURS...\n", flc_w, flc_h, frames);
+        /* First frame in histogram mode: pick 16 colours from what is used. */
+        memset(flc_hist, 0, sizeof(flc_hist));
+        flc_hist_mode = 1;
+        next = doFrame(oframe1);
+        flc_hist_mode = 0;
+        if (next)
+        {
+            chooseColors();
+            buildTables(0, 255);
+            flc_clear(HITBL[0x80] | LOTBL[0]);
+        }
+    }
     if (next == 0)
     {
         irq_remove();
@@ -583,15 +617,9 @@ const char *play(struct Entry *e)
     }
     if (oframe2 == 0)
         oframe2 = next;
-    chooseColors();
-    buildTables(0, 255);
     flc_pal_dirty = 0;
     flc_pal_lo = 255;
     flc_pal_hi = 0;
-
-    for (i = 0; i < 16; ++i)
-        savedPalette[i] = * (byte *) (0xFFB0 + i) & 0x3F;
-    flc_clear(HITBL[0x80] | LOTBL[0]);
     graphicsOn();
 
     off = oframe1;
@@ -602,7 +630,10 @@ const char *play(struct Entry *e)
         next = doFrame(off);
         if (flc_pal_dirty)                  /* remap only what changed */
         {
-            buildTables(flc_pal_lo, flc_pal_hi);
+            if (packed)
+                loadPalette();
+            else
+                buildTables(flc_pal_lo, flc_pal_hi);
             flc_pal_dirty = 0;
             flc_pal_lo = 255;
             flc_pal_hi = 0;
@@ -612,11 +643,15 @@ const char *play(struct Entry *e)
         {
             off = (next == 0) ? oframe1 : oframe2;
             fi = (next == 0) ? 0 : 1;
+            if (next == 0 && packed)
+                flc_clear(0);               /* frame 1 is a delta from black */
         }
         else if (fi == frames && next + 16 > fileSize)
         {
             off = oframe1;                  /* no ring frame: restart */
             fi = 0;
+            if (packed)
+                flc_clear(0);
         }
         else
             off = next;
@@ -647,7 +682,7 @@ void drawList(byte sel, byte top)
 {
     byte r, i;
     cls(255);
-    printf("FLC PLAYER 0.2  %s   DRIVE %u\n", flc_6309 ? "6309" : "6809", drive);
+    printf("FLC PLAYER 0.3  %s   DRIVE %u\n", flc_6309 ? "6309" : "6809", drive);
     printf("--------------------------------");
     if (numEntries == 0)
         printf("\n NO .FLC/.FLI FILES\n");
@@ -741,6 +776,7 @@ int main()
     }
     setHighSpeed(TRUE);                 /* POKE 65497: 1.79 MHz */
     flc_6309 = cpu_is_6309();
+    flc_init();
     width(32);
     for (i = 0; i < 64; ++i)
         sq[i] = (word) i * i;

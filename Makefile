@@ -19,6 +19,7 @@ DISK1   := $(BUILD)/flctest2.dsk
 
 SRCS    := src/main.c src/flcdec.asm
 TESTS   := test/BALLS.FLC test/SMALL.FLC test/BOUNCE.FLI test/LOOP.FLI
+P4TESTS := test/BALLS4.FLI test/LOOP4.FLI
 
 all: $(DISK0) $(DISK1)
 
@@ -46,6 +47,12 @@ $(BUILD)/defs.txt: FORCE | $(BUILD)
 $(TESTS) &: tools/mkflc.py tools/flclib.py
 	$(PYTHON) tools/mkflc.py test
 
+# PACK4 (CoCo packed format) versions of two of them
+test/%4.FLI: test/%.FLC tools/coco16.py tools/flclib.py
+	$(PYTHON) tools/coco16.py --pack4 --verify $< $@
+test/%4.FLI: test/%.FLI tools/coco16.py tools/flclib.py
+	$(PYTHON) tools/coco16.py --pack4 --verify $< $@
+
 $(DISK0): $(BIN) test/BALLS.FLC test/SMALL.FLC
 	rm -f $@
 	$(DECB) dskini $@
@@ -53,12 +60,14 @@ $(DISK0): $(BIN) test/BALLS.FLC test/SMALL.FLC
 	$(DECB) copy -2 -b test/BALLS.FLC $@,BALLS.FLC
 	$(DECB) copy -2 -b test/SMALL.FLC $@,SMALL.FLC
 
-$(DISK1): $(BIN) test/BOUNCE.FLI test/LOOP.FLI
+$(DISK1): $(BIN) test/BOUNCE.FLI test/LOOP.FLI $(P4TESTS)
 	rm -f $@
-	$(DECB) dskini $@
+	$(DECB) dskini -8 $@
 	$(DECB) copy -2 -b $(BIN) $@,FLCPLAY.BIN
 	$(DECB) copy -2 -b test/BOUNCE.FLI $@,BOUNCE.FLI
 	$(DECB) copy -2 -b test/LOOP.FLI $@,LOOP.FLI
+	$(DECB) copy -2 -b test/BALLS4.FLI $@,BALLS4.FLI
+	$(DECB) copy -2 -b test/LOOP4.FLI $@,LOOP4.FLI
 
 $(BUILD):
 	mkdir -p $@
@@ -72,16 +81,16 @@ clean:
 
 # --- 3D PC (1993/94) screen saver animations -------------------------------
 # media/3dpc/*.3D are the original 256-colour FLIs. `make 3dpc` converts them
-# to 16-colour CoCo FLIs (tools/coco16.py) and packs them onto self-booting
-# 80-track disks build/3dpc/3DPC<n>.dsk; the originals that fit in RAM and on
-# a disk go on build/3dpc/ORIG<n>.dsk unconverted.
+# to the CoCo packed format (tools/coco16.py --pack4) and packs them onto
+# self-booting 80-track disks build/3dpc/3DPC<n>.dsk; the originals that fit
+# in RAM and on a disk go on build/3dpc/ORIG<n>.dsk unconverted.
 # The animations aren't ours to distribute, so media/ is not in the repository.
 ORIG3D  := $(wildcard media/3dpc/*.3D)
 CONV3D  := $(patsubst media/3dpc/%.3D,build/3dpc/conv/%.FLI,$(ORIG3D))
 
 build/3dpc/conv/%.FLI: media/3dpc/%.3D tools/coco16.py tools/flclib.py
 	@mkdir -p $(@D)
-	$(PYTHON) tools/coco16.py $< $@
+	$(PYTHON) tools/coco16.py --pack4 $< $@
 
 build/3dpc/orig/%.FLI: media/3dpc/%.3D
 	@mkdir -p $(@D)

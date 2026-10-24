@@ -25,7 +25,8 @@ with numpy + Pillow for the test tools.
 
 ```
 make            # build/FLCPLAY.BIN, build/flcplay.dsk (+ BALLS.FLC, SMALL.FLC),
-                # build/flctest2.dsk (+ BOUNCE.FLI)
+                # build/flctest2.dsk, 80-track (+ BOUNCE.FLI, LOOP.FLI and the
+                # PACK4 test files BALLS4.FLI, LOOP4.FLI)
 make run        # XRoar, CoCo 3 512K, both disks inserted, auto-typed LOADM/EXEC
 ```
 
@@ -51,39 +52,77 @@ ARJ archive split in two, so `cat` them together before extracting. They're stan
 FLI_COPY chunk has a size field 2 bytes low, which both decoders tolerate.
 
 ```
-make 3dpc       # convert + pack: build/3dpc/3DPC1..12.dsk, ORIG1..4.dsk (see *.txt there)
+make 3dpc       # convert + pack: build/3dpc/3DPC1..14.dsk, ORIG1..4.dsk (see *.txt there)
 make run3dpc    # XRoar with 3DPC1/3DPC2 in drives 0/1
 tools/verify3dpc.sh   # play every animation on every disk in XRoar, frame-exact check
 ```
 
-* `tools/coco16.py` converts an FLI/FLC into a 16-colour FLI. It picks one GIME palette from a
-  histogram of all frames, maps every pixel, and re-encodes the deltas. Pixels that changed only
-  by palette noise drop out, so the files get 1.5–5× smaller (DOLPHIN 790K → 153K) and play faster. `--dither` adds a
-  4×4 ordered dither: better gradients, but bigger files.
-* `tools/mkdisks.py` packs files onto self-booting 80-track disks (FLCPLAY.BIN on each).
+* `tools/coco16.py` picks one 16-colour GIME palette from a histogram of all frames, maps every
+  pixel and re-encodes the animation. `make 3dpc` uses `--pack4` (the CoCo packed format below).
+  Without it you get a standard 16-colour FLI. `--dither` adds a 4×4 ordered dither: better
+  gradients, but bigger files.
+* `tools/mkdisks.py` packs files onto self-booting 80-track disks (FLCPLAY.BIN on each, plus one
+  spare granule so a test build of the player fits).
 * `ORIG*.dsk` hold the unconverted originals that fit in RAM and on one disk: SPHERE, BALLS01,
   TOY and HEARTBRN. The player does its own 16-colour reduction on these.
 
-Verified in XRoar (6809, 512K, `tools/verify3dpc.sh`): all 15 converted animations on
-3DPC1–12 and the 4 originals on ORIG1–4 play frame-exact. Loading takes 40–100 s from floppy.
-Uncapped playback speed (each file asks for about 14 fps):
+Verified in XRoar (6809, 512K, `tools/verify3dpc.sh`): all 21 PACK4 animations on 3DPC1–14 and
+the 4 originals on ORIG1–4 play frame-exact. Loading takes 24–99 s from floppy. Uncapped
+playback speed on the 6809 (each file asks for about 14 fps), against the earlier 16-colour FLI
+conversion where there was one:
 
-| Animation | fps | | Animation | fps | | Animation | fps |
-|---|---:|---|---|---:|---|---|---:|
-| APECHASE | 34.3 | | MAGIC7 | 13.3 | | BARS | 4.2 |
-| WORM | 17.1 | | DOLPHIN | 10.7 | | TOY | 4.0 |
-| HEARTBRN | 12.6 | | MORFSKY | 10.4 | | BALLS01 | 3.4 |
-| PHNXRUN | 8.6 | | BADDAY | 5.5 | | SPHERE | 2.6 |
-| MORFFACE | (has empty frames) | | BUBBLES | 2.4 | | FOUNTAIN | 2.0 (6309: 2.3) |
+| Animation | PACK4 | FLI | | Animation | PACK4 | FLI |
+|---|---:|---:|---|---|---:|---:|
+| APECHASE | 60+ | 34.3 | | TOY | 16.6 | 4.0 |
+| WORM | 48.0 | 17.1 | | ONPATROL | 16.0 | — |
+| MAGIC7 | 43.6 | 13.3 | | WHEEL | 14.5 | — |
+| HEARTBRN | 36.9 | 12.6 | | BARS | 13.7 | 4.2 |
+| MORFSKY | 34.3 | 10.4 | | BALLS01 | 13.0 | 3.4 |
+| DOLPHIN | 32.0 | 10.7 | | MARBL1 | 12.6 | — |
+| PHNXRUN | 30.0 | 8.6 | | BUBBLES | 12.0 | 2.4 |
+| CRCLOCK | 24.0 | — | | SPHERE | 10.2 (6309: 16.0) | 2.6 |
+| DRAGON | 20.9 | — | | FOUNTAIN | 8.3 | 2.0 |
+| BADDAY | 17.8 | 5.5 | | TWIRL | 8.0 | — |
 
-The slow ones change a third of the screen or more every frame, in thousands of tiny runs. With
-8-bit FLI data that costs a table lookup per pixel plus about 100 cycles per run. The encoder
-already trades a little size for fewer runs (`GAP`/`MINFILL` in coco16.py, roughly 10–20%
-faster), and falls back to the compact encoding when a file would no longer fit on a disk.
+MORFFACE also plays frame-exact; it has empty frames, so its tick count isn't a useful speed.
 
-What doesn't fit yet (after conversion): BIPROT 640K, GGHYPER 603K, DSK03 576K, MARBL1 536K,
-CRCLOCK 498K, TWIRL 476K and DRAGON 460K are bigger than the 416K of animation RAM. WHEEL (368K)
-and ONPATROL (404K) fit in RAM but not on one 360K disk side.
+Still missing: BIPROT (450K, more than the 416K of animation RAM), and DSK03 (370K) and GGHYPER
+(403K), which each need a little more than one 360K disk side.
+
+## PACK4: the CoCo packed format
+
+FLI/FLC pixels are 8-bit, so every pixel costs a table lookup and nibble packing on the way to
+the 4bpp screen. PACK4 files store the GIME screen bytes themselves. It's an extension inside the
+FLI container, so it is CoCo-only. Other players will reject or ignore it.
+
+* **Header:** a normal FLI header (`$AF11`) with depth = 4 and size 320×200. A smaller animation
+  is centred on a full-screen canvas by the converter.
+* **Palette:** a standard COLOR_64 chunk with 16 entries. The player loads it straight into the
+  GIME palette registers, so there is no colour analysis.
+* **Pixels:** chunk type `$80`. Each chunk is a delta of the 32000 screen bytes, treated as one
+  linear stream (no rows) of packets `skip, count, data`:
+
+  | count | meaning |
+  |---|---|
+  | 1–127 | copy `count` literal bytes |
+  | $81–$FF | fill 256−`count` bytes with the next byte |
+  | 0 | control op, in the next byte: 0 end, 1 next screen page, 2 check source window, 3 nothing (long skips) |
+
+  The encoder knows exactly where the decoder is on screen and in its source window, so it emits
+  the page switches and window checks itself. The packet loop has no bounds checks at all.
+* **First frame:** a delta from a black screen, so there is no separate key-frame type.
+* **Decoder:** about 20 cycles per packet, then a jump through one table into unrolled
+  `ldd ,u++`/`std ,x++` (literals) or `std ,x++` (fills). On a 6309, literals of 3 or more words
+  are a single `TFM`.
+* **Encoder** (`flclib.enc_pack4`): a dynamic program over runs picks literals, fills, skips and
+  which unchanged gaps to copy over, minimising modelled 6809 cycles + 4 × bytes.
+
+Against the 16-colour FLI conversion of the same 3D PC animations, PACK4 files are 25–40%
+smaller and play 3–5× faster.
+
+```
+tools/coco16.py --pack4 IN.FLI OUT.FLI   # convert any FLI/FLC (also prints an fps estimate)
+```
 
 ## How it works
 
@@ -155,18 +194,21 @@ rates in frames per second. Every file matches the reference exactly on both CPU
 | SMALL.FLC  | 161×101, odd width, last-pixel ops  | 32.7 | 37.9 |
 | BOUNCE.FLI | 320×200 FLI_COPY + DELTA_FLI        | 15.0 | 18.0 |
 | LOOP.FLI   | 255×150 BYTE_RUN + DELTA_FLI        | 21.8 | 26.7 |
+| BALLS4.FLI | BALLS.FLC as PACK4                  | 28.8 | 34.3 |
+| LOOP4.FLI  | LOOP.FLI as PACK4 (centred canvas)  | 42.4 | 51.4 |
 
 BOUNCE.FLI was 7.7 fps before the DELTA_FLI rewrite. Note that XRoar labels its 6309
 emulation "unverified".
 
 ## Roadmap
 
-1. Room for the big 3D PC animations. Options: double-sided disks (patch DSKCON's drive table
-   at $D89D in the RAM copy of Disk BASIC 1.1, or a small WD1793 driver of our own, which would
-   also load several times faster); a packed-4-bit "CoCo native" delta chunk (measured at about
-   70% of current size, and a much simpler decode); streaming; 2MB GIME boards.
-2. Per-frame C overhead (32-bit offset maths in `doFrame`/`peek`) could move to asm.
-3. Larger FLCs (640×480 etc.): 2× downscale / crop inside the decoder.
-4. Stream from disk for files that don't fit in RAM (128K CoCo 3, CoCo 1/2).
-5. Composite-monitor palette (currently RGB values).
-6. CoCo 1/2: 6847 VDG output (PMODE 4 dithered or 128×192×4) behind a small platform layer.
+1. Room for BIPROT, DSK03 and GGHYPER: double-sided disks (patch DSKCON's drive table at $D89D
+   in the RAM copy of Disk BASIC 1.1, or a small WD1793 driver of our own, which would also load
+   several times faster), files spanning two disks, or 2MB GIME boards.
+2. PACK4 on the 6809: offset-indexed literal copies (`ldd n,u`/`std n,x`) would save about 10%
+   more on the busiest animations.
+3. Per-frame C overhead (32-bit offset maths in `doFrame`/`peek`) could move to asm.
+4. Larger FLCs (640×480 etc.): 2× downscale / crop inside the decoder.
+5. Stream from disk for files that don't fit in RAM (128K CoCo 3, CoCo 1/2).
+6. Composite-monitor palette (currently RGB values).
+7. CoCo 1/2: 6847 VDG output (PMODE 4 dithered or 128×192×4) behind a small platform layer.

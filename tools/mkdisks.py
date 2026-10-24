@@ -35,7 +35,8 @@ def main():
     a = ap.parse_args()
 
     os.makedirs(a.outdir, exist_ok=True)
-    cap = GRANULES[a.tracks] - grans(a.player)
+    # one granule spare so a bigger (test) build of the player still fits
+    cap = GRANULES[a.tracks] - grans(a.player) - 1
     files, skipped = [], []
     for f in a.files:
         size = os.path.getsize(f)

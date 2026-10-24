@@ -12,3 +12,6 @@ run 1 build/flcplay.dsk test/BALLS.FLC
 run 2 build/flcplay.dsk test/SMALL.FLC
 run 1 build/flctest2.dsk test/BOUNCE.FLI
 run 2 build/flctest2.dsk test/LOOP.FLI
+run 3 build/flctest2.dsk test/BALLS4.FLI
+run 4 build/flctest2.dsk test/LOOP4.FLI
+make -s >/dev/null 2>&1   # leave a normal build behind

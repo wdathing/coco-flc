@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert an FLI/FLC into a CoCo 3 friendly 16-colour FLI.
 
-    coco16.py IN.flc OUT.FLI [--dither] [--preview DIR]
+    coco16.py IN.flc OUT.FLI [--dither] [--pack4] [--preview DIR]
 
 * One palette for the whole animation: a histogram of every frame is binned
   into the GIME 4x4x4 colour cube and 16 colours are picked the same way the
@@ -11,6 +11,9 @@
 * Deltas are re-encoded (BYTE_RUN first frame, DELTA_FLI after, ring frame).
   Pixels that only changed by palette noise collapse to "no change", which
   shrinks the file and speeds up playback.
+* --pack4 writes the CoCo-only packed format instead: header depth 4, a
+  320x200 canvas of GIME screen bytes, a 16-entry COLOR_64 palette and PACK4
+  deltas (flclib.enc_pack4). Smaller, and several times faster to play.
 * --dither uses a 4x4 ordered (Bayer) dither: better gradients, and because
   the pattern is fixed to the screen, still areas stay still between frames.
 """
@@ -135,7 +138,7 @@ def enc_lc_fast(prev, cur):
     return flclib._chunk(flclib.DELTA_FLI, bytes(out))
 
 
-def convert(src, dst, dither=False, preview=None):
+def convert(src, dst, dither=False, preview=None, pack4=False):
     frames, pals = [], []
     for img, pal in flclib.decode(src):
         frames.append(img)
@@ -166,14 +169,29 @@ def convert(src, dst, dither=False, preview=None):
         out.append(d.argmin(-1).astype(np.uint8))
 
     pal16 = [tuple(int(v) for v in c) for c in crgb] + [(0, 0, 0)] * (256 - len(chosen))
-    global GAP, MINFILL
-    body = encode(out, pal16)
-    if 128 + len(body) > DISK_BYTES and (GAP, MINFILL) != (3, 3):
-        GAP, MINFILL = 3, 3     # too big for a disk: fall back to the compact encoding
+    if pack4:
+        # the margin around a smaller animation gets the colour of FLC index 0
+        bg = int(((pals[0][0][None, :] - crgb) ** 2).sum(-1).argmin())
+        h, w = out[0].shape
+        y0, x0 = (200 - h) // 2, ((320 - w) // 2) & ~1
+        canv = []
+        for f in out:
+            c = np.full((200, 320), bg, np.uint8)
+            c[y0:y0 + h, x0:x0 + w] = f
+            canv.append(c)
+        out = canv
+        body = encode_pack4(out, pal16[:16])
+        depth = 4
+    else:
+        global GAP, MINFILL
         body = encode(out, pal16)
+        if 128 + len(body) > DISK_BYTES and (GAP, MINFILL) != (3, 3):
+            GAP, MINFILL = 3, 3     # too big for a disk: fall back to the compact encoding
+            body = encode(out, pal16)
+        depth = 8
     h, w = out[0].shape
     newhdr = bytearray(128)
-    struct.pack_into("<IHHHHHHH", newhdr, 0, 128 + len(body), 0xAF11, len(out), w, h, 8, 3,
+    struct.pack_into("<IHHHHHHH", newhdr, 0, 128 + len(body), 0xAF11, len(out), w, h, depth, 3,
                      max(1, round(speed_ms * 70 / 1000)))
     newhdr[26:58] = hdr[26:58]          # keep the 3DPC tag + title
     with open(dst, "wb") as f:
@@ -207,19 +225,51 @@ def encode(out, pal16):
     return b"".join(chunks_out)
 
 
+LAM = 4.0          # PACK4: decode cycles one byte of file is worth
+LAM_COMPACT = 12.0  # ... when the result would not fit on a disk
+
+
+def encode_pack4(out, pal16):
+    """COLOR_64 + PACK4 from black, PACK4 deltas, ring frame back to frame 1."""
+    scr = [flclib.pack4(f) for f in out]
+
+    def run(lam):
+        chunks_out, cycles = [], []
+        prev = np.zeros(32000, np.uint8)
+        for n, i in enumerate(list(range(len(scr))) + [0]):
+            chunks = [flclib.enc_color(pal16, six_bit=True)] if n == 0 else []
+            c, cyc = flclib.enc_pack4(prev, scr[i], lam)
+            if c:
+                chunks.append(c)
+            cycles.append(cyc)
+            chunks_out.append(flclib._frame(chunks))
+            prev = scr[i]
+        return b"".join(chunks_out), cycles
+
+    body, cycles = run(LAM)
+    if 128 + len(body) > DISK_BYTES:
+        body, cycles = run(LAM_COMPACT)
+    encode_pack4.cycles = cycles[1:]
+    return body
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--dither", action="store_true")
+    ap.add_argument("--pack4", action="store_true", help="CoCo packed 4bpp format")
     ap.add_argument("--preview")
     ap.add_argument("--verify", action="store_true", help="decode the output and compare")
     a = ap.parse_args()
-    size, ncol = convert(a.src, a.dst, a.dither, a.preview)
+    size, ncol = convert(a.src, a.dst, a.dither, a.preview, a.pack4)
     msg = f"{os.path.basename(a.dst)}: {os.path.getsize(a.src) // 1024}K -> {size // 1024}K ({ncol} colours)"
     if a.verify:
         n = sum(1 for _ in flclib.decode(a.dst))
         msg += f", {n} frames decode OK"
+    if a.pack4:
+        cyc = encode_pack4.cycles
+        msg += f", est. {1.79e6 * len(cyc) / max(1, sum(cyc)):.1f} fps"
     print(msg)
 
 

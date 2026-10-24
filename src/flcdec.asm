@@ -51,6 +51,7 @@ _flc_pal        EXPORT
 _flc_hist       EXPORT
 _flc_6309       EXPORT
 _cpu_is_6309    EXPORT
+_flc_init       EXPORT
 
 ;------------------------------------------------------------------------------
 ; void flc_chunk(byte type)
@@ -100,7 +101,11 @@ _flc_chunk
         clr     colsh
         lbsr    color
         bra     @exit
-@n6     cmpb    #11
+@n6     cmpb    #$80
+        bne     @n7
+        lbsr    pack4
+        bra     @exit
+@n7     cmpb    #11
         bne     @exit
         lda     #1
         sta     colsh
@@ -957,6 +962,388 @@ ss2     ldb     ,u+
         lbra    @line
 @done   rts
 
+;------------------------------------------------------------------------------
+; PACK4 ($80, CoCo extension): delta of the 32000 screen bytes themselves,
+; written with no lookups (format: tools/flclib.py enc_pack4). The screen is
+; one linear stream; the encoder tells us when to move the 16K screen window
+; on a page (control op 1) and when to check the source window (op 2), so
+; the packet loop has no bounds checks.
+;   X = screen, U = source, Y = p4mid:
+;   p4mid+2k -> copy k words (k=1..63), p4mid-2k -> fill k words, p4mid -> p4pk
+pack4   clr     scrbank
+        ldd     _flc_scr_pages
+        std     $FFA4
+        ldx     #SCRWIN
+        ldy     #p4mid
+        bra     p4pk
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+        ldd     ,u++
+        std     ,x++
+p4pk    ldb     ,u+                     ; skip 0-255 bytes
+        abx
+        ldb     ,u+                     ; count
+        bmi     @fill
+        beq     @ctl
+        bitb    #1                      ; literal 1-127 bytes
+        bne     @lodd
+        jmp     [b,y]                   ; B = 2 * words
+@lodd   lda     ,u+
+        sta     ,x+
+        decb
+        jmp     [b,y]
+@fill   bitb    #1                      ; fill 256-B bytes with the next byte
+        beq     @fe
+        lda     ,u
+        sta     ,x+
+        incb
+@fe     ldd     b,y                     ; B = -2 * words
+        std     @j+1
+        lda     ,u+
+        tfr     a,b
+@j      jmp     >p4pk
+@ctl    ldb     ,u+
+        beq     @end                    ; 0: end of chunk
+        decb
+        beq     @scr                    ; 1: next screen page
+        decb
+        bne     p4pk                    ; 3: skip only
+        cmpu    #SRCSLD                 ; 2: source window check
+        blo     p4pk
+        lbsr    slide
+        bra     p4pk
+@scr    leax    -$2000,x
+        inc     scrbank
+        ldb     scrbank
+        pshs    x
+        ldx     #_flc_scr_pages
+        abx
+        ldd     ,x
+        std     $FFA4
+        puls    x
+        bra     p4pk
+@end    rts
+; 6309: literals of P4TFM+ words are one TFM (table entries patched by
+; _flc_init). B = 2 * words.
+p4tfm   clra
+        tfr     d,w
+        tfm     u+,x+
+        lbra    p4pk
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+        std     ,x++
+p4fend  bra     p4pk
+        fdb     p4fend-126
+        fdb     p4fend-124
+        fdb     p4fend-122
+        fdb     p4fend-120
+        fdb     p4fend-118
+        fdb     p4fend-116
+        fdb     p4fend-114
+        fdb     p4fend-112
+        fdb     p4fend-110
+        fdb     p4fend-108
+        fdb     p4fend-106
+        fdb     p4fend-104
+        fdb     p4fend-102
+        fdb     p4fend-100
+        fdb     p4fend-98
+        fdb     p4fend-96
+        fdb     p4fend-94
+        fdb     p4fend-92
+        fdb     p4fend-90
+        fdb     p4fend-88
+        fdb     p4fend-86
+        fdb     p4fend-84
+        fdb     p4fend-82
+        fdb     p4fend-80
+        fdb     p4fend-78
+        fdb     p4fend-76
+        fdb     p4fend-74
+        fdb     p4fend-72
+        fdb     p4fend-70
+        fdb     p4fend-68
+        fdb     p4fend-66
+        fdb     p4fend-64
+        fdb     p4fend-62
+        fdb     p4fend-60
+        fdb     p4fend-58
+        fdb     p4fend-56
+        fdb     p4fend-54
+        fdb     p4fend-52
+        fdb     p4fend-50
+        fdb     p4fend-48
+        fdb     p4fend-46
+        fdb     p4fend-44
+        fdb     p4fend-42
+        fdb     p4fend-40
+        fdb     p4fend-38
+        fdb     p4fend-36
+        fdb     p4fend-34
+        fdb     p4fend-32
+        fdb     p4fend-30
+        fdb     p4fend-28
+        fdb     p4fend-26
+        fdb     p4fend-24
+        fdb     p4fend-22
+        fdb     p4fend-20
+        fdb     p4fend-18
+        fdb     p4fend-16
+        fdb     p4fend-14
+        fdb     p4fend-12
+        fdb     p4fend-10
+        fdb     p4fend-8
+        fdb     p4fend-6
+        fdb     p4fend-4
+        fdb     p4fend-2
+p4mid   fdb     p4pk
+P4TFM   equ     3
+        fdb     p4pk-4
+        fdb     p4pk-8
+        fdb     p4pk-12
+        fdb     p4pk-16
+        fdb     p4pk-20
+        fdb     p4pk-24
+        fdb     p4pk-28
+        fdb     p4pk-32
+        fdb     p4pk-36
+        fdb     p4pk-40
+        fdb     p4pk-44
+        fdb     p4pk-48
+        fdb     p4pk-52
+        fdb     p4pk-56
+        fdb     p4pk-60
+        fdb     p4pk-64
+        fdb     p4pk-68
+        fdb     p4pk-72
+        fdb     p4pk-76
+        fdb     p4pk-80
+        fdb     p4pk-84
+        fdb     p4pk-88
+        fdb     p4pk-92
+        fdb     p4pk-96
+        fdb     p4pk-100
+        fdb     p4pk-104
+        fdb     p4pk-108
+        fdb     p4pk-112
+        fdb     p4pk-116
+        fdb     p4pk-120
+        fdb     p4pk-124
+        fdb     p4pk-128
+        fdb     p4pk-132
+        fdb     p4pk-136
+        fdb     p4pk-140
+        fdb     p4pk-144
+        fdb     p4pk-148
+        fdb     p4pk-152
+        fdb     p4pk-156
+        fdb     p4pk-160
+        fdb     p4pk-164
+        fdb     p4pk-168
+        fdb     p4pk-172
+        fdb     p4pk-176
+        fdb     p4pk-180
+        fdb     p4pk-184
+        fdb     p4pk-188
+        fdb     p4pk-192
+        fdb     p4pk-196
+        fdb     p4pk-200
+        fdb     p4pk-204
+        fdb     p4pk-208
+        fdb     p4pk-212
+        fdb     p4pk-216
+        fdb     p4pk-220
+        fdb     p4pk-224
+        fdb     p4pk-228
+        fdb     p4pk-232
+        fdb     p4pk-236
+        fdb     p4pk-240
+        fdb     p4pk-244
+        fdb     p4pk-248
+        fdb     p4pk-252
+
 ; COLOR_256 (4) / COLOR_64 (11): update flc_pal; entries that really change
 ; set flc_pal_dirty and widen flc_pal_lo..flc_pal_hi
 color   ldb     ,u+
@@ -1070,6 +1457,18 @@ irqh    lda     $FF03
 @nh     rti
 
 ;------------------------------------------------------------------------------
+; void flc_init(void): call once after setting flc_6309
+_flc_init
+        tst     _flc_6309
+        beq     @done
+        ldx     #p4mid+2*P4TFM          ; PACK4 long literals -> TFM
+        ldd     #p4tfm
+@lp     std     ,x++
+        cmpx    #p4mid+2*64
+        blo     @lp
+@done   rts
+
+;------------------------------------------------------------------------------
 ; byte cpu_is_6309(void)
 ; $10 $43 is COMD on a 6309; a 6809 ignores the prefix and runs COMA.
 _cpu_is_6309
@@ -1132,4 +1531,5 @@ lastv   rmb     1
 cidx    rmb     1
 ccount  rmb     1
 colsh   rmb     1
+scrbank rmb     1
         ENDSECTION

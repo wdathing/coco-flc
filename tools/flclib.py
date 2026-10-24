@@ -15,7 +15,13 @@ BLACK = 13
 BYTE_RUN = 15    # "BRUN"
 FLI_COPY = 16
 PSTAMP = 18
+PACK4 = 0x80     # CoCo extension: 4bpp screen-byte delta (see enc_pack4)
 FRAME_TYPE = 0xF1FA
+
+# PACK4 control ops (a packet with count 0 is followed by one of these)
+P4_END, P4_SCREEN, P4_SOURCE, P4_NOP = 0, 1, 2, 3
+P4_BANK = 8192          # screen bytes per GIME page
+P4_SRCCHK = 4096        # chunk bytes between source window checks
 
 
 def _chunk(ctype, data):
@@ -32,7 +38,7 @@ def _frame(chunks):
 # ---------------------------------------------------------------- encoders
 
 def enc_color(pal, six_bit=False):
-    out = bytearray(struct.pack("<HBB", 1, 0, 0))  # 1 packet, skip 0, count 0 (=256)
+    out = bytearray(struct.pack("<HBB", 1, 0, len(pal) & 255))  # 1 packet; count 0 = 256
     for r, g, b in pal:
         if six_bit:
             out += bytes((r >> 2, g >> 2, b >> 2))
@@ -248,6 +254,156 @@ def write_anim(path, frames, palettes, kind="flc", speed_ms=66, use_copy_first=F
     return 128 + len(body)
 
 
+# ---------------------------------------------------------------- PACK4
+
+def pack4(frame):
+    """(200, 320) array of 4-bit colours -> 32000 GIME screen bytes."""
+    return ((frame[:, 0::2] << 4) | frame[:, 1::2]).astype(np.uint8).ravel()
+
+
+def unpack4(scr):
+    nib = np.asarray(scr, np.uint8).reshape(200, 160)
+    out = np.empty((200, 320), np.uint8)
+    out[:, 0::2] = nib >> 4
+    out[:, 1::2] = nib & 15
+    return out
+
+
+# 6809 cycle model of the PACK4 decoder, used to choose packets
+P4_OPEN = 30        # a literal packet: skip, count, dispatch
+P4_ODD = 14         # odd byte in a literal or fill
+P4_LIT = 8          # per literal byte (ldd ,u++ / std ,x++)
+P4_FOPEN = 50       # a fill packet
+P4_FILL = 4         # per fill byte (std ,x++)
+
+
+def enc_pack4(prev, cur, lam=4.0):
+    """PACK4 chunk taking screen bytes prev -> cur (32000 each), or None.
+
+    The 32000-byte screen is one linear stream of packets:
+        skip, count, data
+    skip 0-255 bytes, then count 1..127 literal bytes, or count $81..$FF
+    (256-n) fills n bytes with the next byte. count 0 is a control op whose
+    byte follows: P4_END, P4_SCREEN (move the decoder's 16K screen window on
+    by one 8K page), P4_SOURCE (let the decoder slide its source window) or
+    P4_NOP (just the skip). The encoder emits P4_SCREEN as soon as a packet
+    would start past the first page of the window, and P4_SOURCE every 4K.
+
+    Packets are chosen by a DP over runs minimising decode cycles + lam*bytes.
+    Returns (chunk, estimated 6809 decode cycles).
+    """
+    prev = np.asarray(prev, np.uint8)
+    cur = np.asarray(cur, np.uint8)
+    diff = prev != cur
+    if not diff.any():
+        return None, 0
+    n = cur.size
+    # segments: maximal runs that are unchanged, or changed with one value
+    key = np.where(diff, cur.astype(np.int32), -1)
+    cut = np.flatnonzero(key[1:] != key[:-1]) + 1
+    starts = np.r_[0, cut]
+    seg = list(zip(starts.tolist(), np.diff(np.r_[starts, n]).tolist(), key[starts].tolist()))
+    while seg[-1][2] < 0:
+        seg.pop()
+
+    inf = float("inf")
+    lit_open = P4_OPEN + 2 * lam + P4_ODD / 2
+    lit_byte = P4_LIT + lam + lit_open / 127
+
+    def fill_cost(ln):
+        return -(-ln // 127) * (P4_FOPEN + 3 * lam) + P4_FILL * ln
+
+    L, F = inf, 0.0                 # a literal packet open / closed
+    back = []
+    for st, ln, v in seg:
+        if v < 0:                   # unchanged: copy inside a literal, or skip
+            skipc = (ln // 256) * (P4_OPEN + 3 * lam)
+            nl, lsrc = L + ln * lit_byte, "L"
+            nf, fsrc = (L + skipc, "L") if L < F else (F + skipc, "F")
+        else:                       # changed run: literal, or fill
+            a, b = L + ln * lit_byte, F + lit_open + ln * lit_byte
+            nl, lsrc = (a, "L") if a <= b else (b, "F")
+            nf, fsrc = (L + fill_cost(ln), "L") if L < F else (F + fill_cost(ln), "F")
+        back.append((lsrc, fsrc))
+        L, F = nl, nf
+    state = "L" if L <= F else "F"
+    tok = [None] * len(seg)
+    for i in range(len(seg) - 1, -1, -1):
+        lsrc, fsrc = back[i]
+        if state == "L":
+            tok[i], state = "lit", lsrc
+        else:
+            tok[i], state = ("skip" if seg[i][2] < 0 else "fill"), fsrc
+
+    # packets: (start, count byte, data, screen bytes)
+    pk = []
+    i = 0
+    while i < len(seg):
+        st, ln, v = seg[i]
+        if tok[i] == "lit":
+            j = i
+            while j < len(seg) and tok[j] == "lit":
+                j += 1
+            end = seg[j - 1][0] + seg[j - 1][1]
+            for s in range(st, end, 127):
+                c = min(127, end - s)
+                pk.append((s, c, cur[s:s + c].tobytes(), c))
+            i = j
+            continue
+        if tok[i] == "fill":
+            for s in range(st, st + ln, 127):
+                c = min(127, st + ln - s)
+                pk.append((s, 256 - c, bytes((v,)), c))
+        i += 1
+
+    out = bytearray()
+    pos = bank = since = 0
+    for s, cb, data, ln in pk:
+        while True:
+            if pos >= (bank + 1) * P4_BANK:
+                out += bytes((0, 0, P4_SCREEN))
+                bank += 1
+            elif since >= P4_SRCCHK:
+                out += bytes((0, 0, P4_SOURCE))
+                since = 0
+            elif s - pos > 255:
+                out += bytes((255, 0, P4_NOP))
+                pos += 255
+                since += 3
+            else:
+                break
+        out += bytes((s - pos, cb)) + data
+        since += 2 + len(data)
+        pos = s + ln
+    out += bytes((0, 0, P4_END))
+    est = sum((P4_OPEN + P4_LIT * ln) if cb < 128 else (P4_FOPEN + P4_FILL * ln)
+              for s, cb, data, ln in pk) + P4_ODD * sum(ln & 1 for *_, ln in pk)
+    return _chunk(PACK4, bytes(out)), est
+
+
+def dec_pack4(scr, c):
+    """Apply PACK4 chunk data c to a 32000-byte bytearray."""
+    q = pos = 0
+    while True:
+        pos += c[q]
+        cb = c[q + 1]
+        q += 2
+        if cb == 0:
+            op = c[q]
+            q += 1
+            if op == P4_END:
+                return
+        elif cb < 128:
+            scr[pos:pos + cb] = c[q:q + cb]
+            q += cb
+            pos += cb
+        else:
+            n = 256 - cb
+            scr[pos:pos + n] = bytes((c[q],)) * n
+            q += 1
+            pos += n
+
+
 # ---------------------------------------------------------------- decoder
 
 def decode(path):
@@ -261,6 +417,9 @@ def decode(path):
         if o1:
             off = o1
     screen = np.zeros((h, w), np.uint8)
+    packed = struct.unpack_from("<H", data, 12)[0] == 4
+    if packed:
+        scr4 = bytearray(32000)
     pal = [(0, 0, 0)] * 256
     while off + 16 <= len(data):
         fsize, ftype, nchunks = struct.unpack_from("<IHH", data, off)
@@ -286,6 +445,9 @@ def decode(path):
                             pal[i & 255] = (r, g, b)
                             i += 1
                             q += 3
+                elif ctype == PACK4:
+                    dec_pack4(scr4, c)
+                    screen = unpack4(scr4)
                 elif ctype == BLACK:
                     screen[:] = 0
                 elif ctype == FLI_COPY:
