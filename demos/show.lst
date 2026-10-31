@@ -1,0 +1,30 @@
+# General showcase set, from the "Interact" CD-ROM (1993/94) ANIMATE directory.
+#
+# NAME     SOURCE         coco16.py options
+DOLPHIN    DOLPHIN.FLI
+NEWTON     NEWTONLO.FLI   --step 2              # Newton's cradle
+CLOCK      CLOCK05.FLI                          # cartoon alarm clock
+TOYMAN     TOYMAN01.FLI                         # drummer
+APPLE      APPLE.FLI
+WACKYBOT   WACKYBOT.FLI
+ASLAMP     ASLAMP.FLI                           # desk lamp
+BALLOON    BALLOON.FLC                          # 640x480, scaled
+HAND       HAND.FLI
+CANADA     CANADA.FLI                           # waving flag
+USFLAG     USFLAG1.FLC                          # 640x480, scaled
+GLOBE      GLOBE_GO.FLI
+WATCH      WATCH.FLI
+CUBE       CUBE2.FLI                            # Rubik's cube
+PONY       PONYROCK.FLI
+CHAIR      R_CHAIR.FLI
+FISH       FISH_C.FLI
+FAN        FAN.FLI
+CHUBBY     CHUBBY03.FLI
+JELLY      JELYFISH.FLI
+BLAST      BLAST.FLI
+ROBOT      ROBOT.FLI
+TUNNEL     SAUCER04.FLI
+LAMP       LAMP.FLI
+INVOKE     INVOKE.FLI
+ANT        ANT05.FLI      --frames 0:66
+WASP       WASP6.FLI      --step 2

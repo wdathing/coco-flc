@@ -1,0 +1,20 @@
+# Halloween demo set, from the "Interact" CD-ROM (1993/94) ANIMATE directory.
+# make demos DEMOSRC=<dir with those files>     (default media/interact)
+#
+# NAME     SOURCE         coco16.py options
+PUMPKIN    PUMPKI01.FLI   --cmp                 # jack-o'-lanterns, composite colours
+GHOSTPEN   GHOSTPEN.FLI                         # pen writing by itself, oil lamp
+EYES       EYEBALLC.FLI   --frames 238:420      # big eyeballs rolling around
+EYESWARM   EYEBALLC.FLI   --frames 0:180        # eyeballs swarming out
+SKELHAND   VPHAND.FLI     --frames 45:161       # hand peels to a skeleton
+GIANT      THEGIANT.FLI   --frames 55:128 --step 2   # Bigfoot walk cycle
+STORM      VENOP.FLI                            # twister, lightning
+HEAD       LASTHE01.FLI                         # floating head
+CANDLE     TIME3.FLI                            # candle burning down, melting clocks
+FACES      FACETALK.FLI                         # morphing faces
+DEMON      KRAG08.FLI                           # horned warrior
+MASK       SNEEZE.FLI                           # chrome mask
+WIZARD     WIZAIR.FLC                           # wizard (640x480, scaled)
+HATCH      HAND.FLC                             # claw hatching from an egg (640x480)
+CLOWNS     CLOWNS.FLI
+TREX       TYRANREX.FLI   --frames 0:68

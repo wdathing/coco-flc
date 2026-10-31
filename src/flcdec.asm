@@ -26,6 +26,11 @@ HITBL   equ     $0F00
 HIMID   equ     $0F80
 SRCSLD  equ     $E000
 SCRWIN  equ     $8000
+; In BASIC's page $3B at $6000-$7FFF, after main.c's struct Data: only used
+; while the file window isn't mapped there. (Not in a SECTION: an equ there
+; is relative to the section.)
+FLCPAL  equ     $7A00                   ; flc_pal[768]
+FLCHIST equ     $7D00                   ; flc_hist[256] words, up to $7EFF
 
         PRAGMA  autobranchlength
         SECTION code
@@ -47,8 +52,6 @@ _flc_pal_dirty  EXPORT
 _flc_pal_lo     EXPORT
 _flc_pal_hi     EXPORT
 _flc_ticks      EXPORT
-_flc_pal        EXPORT
-_flc_hist       EXPORT
 _flc_6309       EXPORT
 _cpu_is_6309    EXPORT
 _flc_init       EXPORT
@@ -297,7 +300,7 @@ hlit    std     cnt
         clra
         lslb
         rola
-        addd    #_flc_hist
+        addd    #FLCHIST
         tfr     d,x
         ldd     ,x
         addd    #1
@@ -324,7 +327,7 @@ hfill   std     fc
         clra
         lslb
         rola
-        addd    #_flc_hist
+        addd    #FLCHIST
         tfr     d,x
         ldd     ,x
         addd    ,s
@@ -1365,7 +1368,7 @@ color   ldb     ,u+
         lda     cidx
         ldb     #3
         mul
-        addd    #_flc_pal
+        addd    #FLCPAL
         tfr     d,x
 @c      ldb     #3
         clr     chg
@@ -1393,7 +1396,7 @@ color   ldb     ,u+
 @l2     inc     _flc_pal_dirty
 @nc     inc     cidx
         bne     @nw
-        ldx     #_flc_pal               ; index wrapped past 255
+        ldx     #FLCPAL                 ; index wrapped past 255
 @nw     dec     ccount
         bne     @c
         bra     @pk
@@ -1509,8 +1512,6 @@ _flc_pal_lo     rmb     1
 _flc_pal_hi     rmb     1
 chg     rmb     1
 _flc_ticks      rmb     1
-_flc_pal        rmb     768
-_flc_hist       rmb     512
 _flc_6309       rmb     1
 cntb    rmb     1
 mmusv   rmb     4

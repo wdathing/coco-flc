@@ -59,7 +59,8 @@ def main():
             last = t
         g.resume()
         avg = sum(deltas) / len(deltas)
-        print(f"[{a.cpu}] ticks/frame {deltas} avg {avg:.2f} = {60 / avg:.1f} fps")
+        fps = f"{60 / avg:.1f}" if avg else "60+"     # frames shorter than a tick
+        print(f"[{a.cpu}] ticks/frame {deltas} avg {avg:.2f} = {fps} fps")
         for i in range(a.frames):
             out = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "xgrab.py"),
                                   os.path.join(ROOT, "build", f"xtest{i}.png"), "--sync",

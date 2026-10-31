@@ -10,7 +10,7 @@ XROAR   ?= xroar
 PYTHON  ?= python3
 
 ORG     := 1000
-LIMIT   := 5C00
+LIMIT   := 5E00
 
 BUILD   := build
 BIN     := $(BUILD)/FLCPLAY.BIN
@@ -26,6 +26,8 @@ all: $(DISK0) $(DISK1)
 # Test hooks: make AUTOPLAY=1 AUTOEXIT=2 plays file #1 at start and returns to
 # the browser after two loops (the emulator can't press keys for us).
 # NODELAY=1 ignores the file's frame delay to measure raw decode speed.
+# AUTOKEYS=DDE types keys into the browser first: D down, U up, E ENTER,
+# L left, lower case letters are those keys (k: K).
 DEFS    :=
 ifdef AUTOPLAY
 DEFS    += -DAUTOPLAY=$(AUTOPLAY)
@@ -35,6 +37,9 @@ DEFS    += -DAUTOEXIT=$(AUTOEXIT)
 endif
 ifdef NODELAY
 DEFS    += -DNODELAY
+endif
+ifdef AUTOKEYS
+DEFS    += -DAUTOKEYS=$(AUTOKEYS)
 endif
 
 $(BIN): $(SRCS) $(BUILD)/defs.txt | $(BUILD)
@@ -74,7 +79,7 @@ $(BUILD):
 
 run: all
 	$(XROAR) -default-machine coco3 -ram 512 -load-fd0 $(DISK0) -load-fd1 $(DISK1) \
-	    -type 'LOADM"FLCPLAY":EXEC\r'
+	    -type 'RGB:LOADM"FLCPLAY":EXEC\r'
 
 clean:
 	rm -rf $(BUILD)
@@ -82,8 +87,9 @@ clean:
 # --- 3D PC (1993/94) screen saver animations -------------------------------
 # media/3dpc/*.3D are the original 256-colour FLIs. `make 3dpc` converts them
 # to the CoCo packed format (tools/coco16.py --pack4) and packs them onto
-# self-booting 80-track disks build/3dpc/3DPC<n>.dsk; the originals that fit
-# in RAM and on a disk go on build/3dpc/ORIG<n>.dsk unconverted.
+# self-booting double-sided 80-track disks build/3dpc/3DPC<n>.dsk (720K; the
+# player's S key switches to double-sided); the originals that fit in RAM go
+# on build/3dpc/ORIG<n>.dsk unconverted.
 # The animations aren't ours to distribute, so media/ is not in the repository.
 ORIG3D  := $(wildcard media/3dpc/*.3D)
 CONV3D  := $(patsubst media/3dpc/%.3D,build/3dpc/conv/%.FLI,$(ORIG3D))
@@ -99,12 +105,29 @@ build/3dpc/orig/%.FLI: media/3dpc/%.3D
 3dpc: $(BIN) $(CONV3D) $(patsubst media/3dpc/%.3D,build/3dpc/orig/%.FLI,$(ORIG3D))
 	@test -n "$(ORIG3D)" || { echo "no media/3dpc/*.3D files (not distributed; supply your own)"; exit 1; }
 	rm -f build/3dpc/*.dsk
-	$(PYTHON) tools/mkdisks.py build/3dpc 3DPC $(BIN) $(CONV3D)
-	$(PYTHON) tools/mkdisks.py build/3dpc ORIG $(BIN) build/3dpc/orig/*.FLI
+	$(PYTHON) tools/mkdisks.py build/3dpc 3DPC $(BIN) $(CONV3D) --sides 2
+	$(PYTHON) tools/mkdisks.py build/3dpc ORIG $(BIN) build/3dpc/orig/*.FLI --sides 2
 
 run3dpc: 3dpc
 	$(XROAR) -default-machine coco3 -ram 512 -tv-input rgb \
 	    -load-fd0 build/3dpc/3DPC1.dsk -load-fd1 build/3dpc/3DPC2.dsk \
-	    -type 'LOADM"FLCPLAY":EXEC\r'
+	    -type 'RGB:LOADM"FLCPLAY":EXEC\r'
 
-.PHONY: all run clean FORCE 3dpc run3dpc
+# --- demo sets ---------------------------------------------------------------
+# demos/*.lst name animations (with trims) from the 1993/94 "Interact" CD-ROM.
+# `make demos` converts them and packs build/demos/<SET><n>.dsk (single-sided
+# 80 tracks, FLCPLAY.BIN on each). `make install-demos` copies them to TNFS.
+DEMOSRC ?= media/interact
+TNFS    ?= $(HOME)/tnfsmnt/flcdemo
+DEMOS   := $(wildcard demos/*.lst)
+
+demos: $(BIN)
+	@for l in $(DEMOS); do $(PYTHON) tools/mkdemo.py $$l build/demos --src $(DEMOSRC) || exit 1; done
+
+install-demos: demos
+	mkdir -p $(TNFS)
+	cp build/demos/*.dsk build/demos/*.txt $(TNFS)/
+	@for d in build/demos/conv/*/; do s=$$(basename $$d); \
+	    mkdir -p $(TNFS)/$$s && cp $$d*.FLI $(TNFS)/$$s/ && echo "$(TNFS)/$$s/"; done
+
+.PHONY: all run clean FORCE 3dpc run3dpc demos install-demos
